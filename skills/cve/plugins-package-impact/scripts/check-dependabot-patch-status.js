@@ -20,7 +20,8 @@
  * are patched to the advisory fix level, and whether remaining open alerts
  * are runner-only (safe to dismiss at alert-level).
  *
- * Uses GitHub REST (fetch) only — never the gh CLI.
+ * Uses GitHub REST (fetch) only — never the gh CLI — unless --alerts-json
+ * supplies a snapshot (no token, no network).
  */
 
 import { execFile as execFileCb } from 'child_process';
@@ -31,8 +32,10 @@ import { dirname, resolve as resolvePath } from 'path';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
 
-import { resolveGithubToken } from './github-auth.js';
-import { resolveGithubRepo } from './github-repo.js';
+import {
+  alertHasPatchMetadata,
+  loadDependabotAlerts,
+} from './dependabot-alerts.js';
 import {
   buildVersionStatuses,
   patchedVersions,
@@ -41,8 +44,6 @@ import {
 
 const execFile = promisify(execFileCb);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-const API_BASE = 'https://api.github.com';
 
 function usage() {
   console.error(`Usage: check-dependabot-patch-status.js [options] <workspace> [package]
@@ -53,7 +54,7 @@ range, run impact classification, and report whether runner alerts can be
 dismissed because prod paths are patched (or no PLUGIN_PROD alerts remain).
 
 Uses GitHub REST (not gh). Token: GITHUB_TOKEN / GH_TOKEN in the
-environment or a .env file near cwd.
+environment or a .env file near cwd. --alerts-json skips REST and token.
 Needs --repo-root / RHDH_PLUGINS_ROOT (or cwd in a checkout)
 for yarn.lock + classify.
 
@@ -63,6 +64,10 @@ Options:
   --repo-root <path>             Local checkout path for yarn.lock / yarn why
   --repo <owner/name>            Remote GitHub repo for REST alerts
                                  (default: detect from GITHUB_REPOSITORY or git origin in --repo-root)
+  --alerts-json <file>           Snapshot of GitHub Dependabot alert objects
+                                 (array, or { "alerts": [...] }). No REST.
+                                 Prefer the raw list-alerts payload so
+                                 security_vulnerability ranges are present.
   --table                        Markdown classification table (default)
   --json                         Machine-readable JSON
   -h, --help                     Show this help
@@ -72,6 +77,8 @@ Examples:
     --repo-root /path/to/plugins-repo extensions
   GITHUB_TOKEN=… node check-dependabot-patch-status.js \\
     --repo-root /path/to/plugins-repo extensions --json
+  node check-dependabot-patch-status.js \\
+    --repo-root /path/to/plugins-repo --alerts-json /tmp/dependabot-alerts.json homepage
   GITHUB_TOKEN=… node check-dependabot-patch-status.js \\
     --repo-root /path/to/plugins-repo extensions lodash --table
 `);
@@ -82,6 +89,7 @@ function parseArgs(argv) {
   const options = {
     repoRoot: undefined,
     repo: undefined,
+    alertsJson: undefined,
   };
   const positional = [];
 
@@ -102,6 +110,11 @@ function parseArgs(argv) {
       options.repo = argv[++i];
       if (!options.repo) {
         throw new Error('--repo requires owner/name');
+      }
+    } else if (arg === '--alerts-json') {
+      options.alertsJson = argv[++i];
+      if (!options.alertsJson) {
+        throw new Error('--alerts-json requires a file path');
       }
     } else if (arg === '--token') {
       throw new Error(
@@ -151,28 +164,6 @@ function findRepoRoot(explicitRoot) {
   throw new Error(
     'Could not find repo root. Pass --repo-root or set RHDH_PLUGINS_ROOT.',
   );
-}
-
-function resolveToken() {
-  return resolveGithubToken({
-    requiredFor: 'Dependabot alerts read',
-  });
-}
-
-function parseOwnerRepo(repo) {
-  const [owner, name, ...rest] = repo.split('/');
-  if (!owner || !name || rest.length) {
-    throw new Error(`Invalid --repo "${repo}"; expected owner/name`);
-  }
-  return { owner, repo: name, full: `${owner}/${name}` };
-}
-
-function parseNextLink(linkHeader) {
-  if (!linkHeader) {
-    return null;
-  }
-  const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
-  return match ? match[1] : null;
 }
 
 function classifyManifest(manifestPath, scope) {
@@ -305,42 +296,6 @@ function versionPatchedAgainstAlerts(semver, version, alerts) {
     return { patched: true, reason: 'outside all open advisory ranges', checks };
   }
   return { patched: null, reason: 'incomplete advisory metadata', checks };
-}
-
-async function fetchOpenAlerts({ token, owner, repo }) {
-  const alerts = [];
-  const params = new URLSearchParams({ state: 'open', per_page: '100' });
-  let nextUrl = `${API_BASE}/repos/${owner}/${repo}/dependabot/alerts?${params}`;
-
-  while (nextUrl) {
-    const response = await fetch(nextUrl, {
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${token}`,
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'plugins-package-impact',
-      },
-    });
-    const text = await response.text();
-    let data;
-    try {
-      data = text ? JSON.parse(text) : [];
-    } catch {
-      data = { message: text };
-    }
-    if (!response.ok) {
-      throw new Error(
-        `GitHub API error for ${owner}/${repo} (HTTP ${response.status}): ${data?.message || response.statusText}`,
-      );
-    }
-    if (!Array.isArray(data) || data.length === 0) {
-      break;
-    }
-    alerts.push(...data);
-    nextUrl = parseNextLink(response.headers.get('link'));
-  }
-
-  return alerts;
 }
 
 function summarizeAlert(alert) {
@@ -685,17 +640,16 @@ async function main() {
     throw new Error(`No yarn.lock at workspaces/${workspace}`);
   }
 
-  const resolvedRepo = await resolveGithubRepo({
-    explicitRepo: options.repo,
-    cwd: repoRoot,
-    requiredFor: 'Dependabot alerts read',
-  });
-  const { owner, repo, full: repoFull } = parseOwnerRepo(resolvedRepo);
-  const token = resolveToken();
   const semver = loadSemver(repoRoot);
   const lockfileText = await readFile(lockPath, 'utf8');
 
-  const allAlerts = await fetchOpenAlerts({ token, owner, repo });
+  const { alerts: allAlerts, repo: repoFull, fromSnapshot } =
+    await loadDependabotAlerts({
+      alertsJson: options.alertsJson,
+      explicitRepo: options.repo,
+      cwd: repoRoot,
+      state: 'open',
+    });
   const prefix = `workspaces/${workspace}/`;
   const workspaceAlerts = allAlerts.filter(a => {
     const manifest = a.dependency?.manifest_path || '';
@@ -703,6 +657,15 @@ async function main() {
       ? workspace === 'root'
       : manifest.startsWith(prefix);
   });
+
+  if (fromSnapshot) {
+    const missingPatch = workspaceAlerts.filter(a => !alertHasPatchMetadata(a));
+    if (missingPatch.length) {
+      console.error(
+        `Warning: ${missingPatch.length} snapshot alert(s) lack security_vulnerability ranges; patch-status may be incomplete. Dump the raw GitHub list-alerts payload.`,
+      );
+    }
+  }
 
   const packageNames = onlyPackage
     ? [onlyPackage]
@@ -718,6 +681,7 @@ async function main() {
     const empty = {
       repo: repoFull,
       workspace,
+      source: fromSnapshot ? 'alerts-json' : 'github-rest',
       packageCount: 0,
       results: [],
     };
@@ -770,6 +734,7 @@ async function main() {
     repo: repoFull,
     workspace,
     repoRoot,
+    source: fromSnapshot ? 'alerts-json' : 'github-rest',
     packageCount: results.length,
     results,
     dismissRunnerCandidates: results

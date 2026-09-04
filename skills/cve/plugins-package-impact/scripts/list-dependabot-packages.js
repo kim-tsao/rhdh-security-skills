@@ -20,14 +20,12 @@
  * workspace (or a specific manifest). Output is the package list used as
  * input to classify-cve-source.js impact assessment.
  *
- * Uses GitHub REST (fetch) only — never the gh CLI.
+ * Uses GitHub REST (fetch) only — never the gh CLI — unless --alerts-json
+ * supplies a snapshot (no token, no network).
  * Token from GITHUB_TOKEN / GH_TOKEN env or a .env file (see github-auth.js).
  */
 
-import { resolveGithubToken } from './github-auth.js';
-import { resolveGithubRepo } from './github-repo.js';
-
-const API_BASE = 'https://api.github.com';
+import { loadDependabotAlerts } from './dependabot-alerts.js';
 
 function usage() {
   console.error(`Usage: list-dependabot-packages.js [options] <workspace-or-manifest>
@@ -37,7 +35,7 @@ workspaces/<name>/) or a single manifest path, and print the unique package
 names — the input set for classify-cve-source.js.
 
 Uses GitHub REST API (not gh). Token: GITHUB_TOKEN / GH_TOKEN in the
-environment or a .env file near cwd.
+environment or a .env file near cwd. --alerts-json skips REST and token.
 
 <workspace-or-manifest> may be:
   homepage
@@ -45,7 +43,10 @@ environment or a .env file near cwd.
   workspaces/homepage/yarn.lock
 
 Options:
-  --repo <owner/name>            Remote GitHub repo for REST alerts\n                                 (default: detect from GITHUB_REPOSITORY or git origin)
+  --repo <owner/name>            Remote GitHub repo for REST alerts
+                                 (default: detect from GITHUB_REPOSITORY or git origin)
+  --alerts-json <file>           Snapshot of GitHub Dependabot alert objects
+                                 (array, or { "alerts": [...] }). No REST.
   --state <open|dismissed|fixed|auto_dismissed|all>
                                  Alert state filter (default: open)
   --scope <runtime|development>  Optional dependency scope filter
@@ -58,6 +59,7 @@ Options:
 Examples:
   GITHUB_TOKEN=… node list-dependabot-packages.js homepage
   GITHUB_TOKEN=… node list-dependabot-packages.js homepage --json
+  node list-dependabot-packages.js homepage --alerts-json /tmp/dependabot-alerts.json
   GITHUB_TOKEN=… node list-dependabot-packages.js workspaces/homepage/yarn.lock --exact-manifest
 `);
 }
@@ -68,6 +70,7 @@ function parseArgs(argv) {
     state: 'open',
     scope: undefined,
     repo: undefined,
+    alertsJson: undefined,
   };
   const positional = [];
 
@@ -86,6 +89,11 @@ function parseArgs(argv) {
       options.repo = argv[++i];
       if (!options.repo) {
         throw new Error('--repo requires owner/name');
+      }
+    } else if (arg === '--alerts-json') {
+      options.alertsJson = argv[++i];
+      if (!options.alertsJson) {
+        throw new Error('--alerts-json requires a file path');
       }
     } else if (arg === '--token') {
       throw new Error(
@@ -109,20 +117,6 @@ function parseArgs(argv) {
   }
 
   return { flags, options, positional };
-}
-
-function resolveToken() {
-  return resolveGithubToken({
-    requiredFor: 'Dependabot alerts read',
-  });
-}
-
-function parseOwnerRepo(repo) {
-  const [owner, name, ...rest] = repo.split('/');
-  if (!owner || !name || rest.length) {
-    throw new Error(`Invalid --repo "${repo}"; expected owner/name`);
-  }
-  return { owner, repo: name };
 }
 
 /**
@@ -176,73 +170,6 @@ function normalizeWorkspaceInput(input, exactManifestFlag) {
   throw new Error(
     `Expected workspace name or workspaces/<name>/… path, got "${input}"`,
   );
-}
-
-function parseNextLink(linkHeader) {
-  if (!linkHeader) {
-    return null;
-  }
-  const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
-  return match ? match[1] : null;
-}
-
-function formatApiError(status, message, repo) {
-  if (status === 401 || status === 403) {
-    return `Failed to access Dependabot alerts for ${repo} (HTTP ${status}). Check GITHUB_TOKEN permissions. Details: ${message}`;
-  }
-  if (status === 404) {
-    return `Dependabot alerts not found for ${repo} (HTTP 404). Details: ${message}`;
-  }
-  return `GitHub API error for ${repo}: ${message}`;
-}
-
-async function fetchAllAlerts({ token, owner, repo, state }) {
-  const alerts = [];
-  const params = new URLSearchParams({ per_page: '100' });
-  if (state && state !== 'all') {
-    params.set('state', state);
-  }
-  let nextUrl = `${API_BASE}/repos/${owner}/${repo}/dependabot/alerts?${params}`;
-
-  while (nextUrl) {
-    const response = await fetch(nextUrl, {
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${token}`,
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'plugins-package-impact',
-      },
-    });
-
-    const text = await response.text();
-    let data = null;
-    if (text) {
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = { message: text };
-      }
-    }
-
-    if (!response.ok) {
-      throw new Error(
-        formatApiError(
-          response.status,
-          data?.message || response.statusText,
-          `${owner}/${repo}`,
-        ),
-      );
-    }
-
-    if (!Array.isArray(data) || data.length === 0) {
-      break;
-    }
-
-    alerts.push(...data);
-    nextUrl = parseNextLink(response.headers.get('link'));
-  }
-
-  return alerts;
 }
 
 function summarizeAlert(alert) {
@@ -339,17 +266,10 @@ async function main() {
     positional[0],
     flags.has('exact-manifest'),
   );
-  const repoFull = await resolveGithubRepo({
+  const { alerts: allAlerts, repo: repoFull, fromSnapshot } = await loadDependabotAlerts({
+    alertsJson: options.alertsJson,
     explicitRepo: options.repo,
-    requiredFor: 'Dependabot alerts read',
-  });
-  const { owner, repo } = parseOwnerRepo(repoFull);
-  const token = resolveToken();
-
-  const allAlerts = await fetchAllAlerts({
-    token,
-    owner,
-    repo,
+    cwd: process.cwd(),
     state: options.state,
   });
 
@@ -372,6 +292,7 @@ async function main() {
           exactManifest,
           state: options.state,
           scope: options.scope ?? null,
+          source: fromSnapshot ? 'alerts-json' : 'github-rest',
           alertCount: filtered.length,
           packageCount: packageNames.length,
           packages: packageNames,

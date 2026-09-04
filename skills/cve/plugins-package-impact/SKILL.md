@@ -4,8 +4,9 @@ description: >-
   Classifies whether an npm package in a Backstage-style plugins monorepo reaches
   published plugin code (PLUGIN_PROD), plugin dev harnesses (PLUGIN_DEV), local
   runners packages/app|app-legacy|backend (RUNNER), or workspace root
-  (WORKSPACE_DEV).   Discovers packages from open Dependabot alerts for a
-  workspace, classifies impact, and checks whether versions meet Dependabot
+  (WORKSPACE_DEV). Discovers packages from open Dependabot alerts for a
+  workspace (GitHub REST or a runner --alerts-json snapshot),
+  classifies impact, and checks whether versions meet Dependabot
   first_patched_version so runner alerts can be dismissed when prod is patched.
   Use when assessing Dependabot alerts, deciding if a CVE is runner-only,
   plugin-dev-only, or workspace-dev-only and safe to dismiss (with SBOM bump
@@ -108,22 +109,21 @@ Default reason: `not_used`. Comment should cite classification, e.g. `runner-onl
 - Working directory (or `RHDH_PLUGINS_ROOT` / `--repo-root`) is a checkout with `workspaces/<name>/` and `yarn.lock` (for classify)
 - Prefer `yarn install` in the target workspace before classifying
 - `node` ≥ 18
-- GitHub PAT with Dependabot alerts read (and write to dismiss):
-  - `GITHUB_TOKEN` or `GH_TOKEN` in the environment, **or**
-  - the same keys in a `.env` file (scripts walk up from cwd; do not override existing env)
+- GitHub PAT (`GITHUB_TOKEN` / `GH_TOKEN` or a cwd-walked `.env`) for REST, **or** `--alerts-json` (no token)
 
-### `--repo` vs `--repo-root`
+### `--repo` vs `--repo-root` vs `--alerts-json`
 
 - `--repo <owner/name>` = **remote GitHub repository** queried by Dependabot REST API calls.
   - default resolution order: explicit `--repo`, then `GITHUB_REPOSITORY`, then `origin` remote from current checkout (or `--repo-root` for scripts that use it)
 - `--repo-root <path>` = **local checkout path** used for `yarn.lock` + `yarn why` classification.
+- `--alerts-json <file>` = **snapshot** of GitHub list-alerts objects (JSON array, or `{ "alerts": [...] }`). No REST. Dump with `gh api --paginate --slurp "repos/OWNER/REPO/dependabot/alerts?state=open"`. Must include `security_vulnerability` (ranges / `first_patched_version`) for patch-status. Token not required.
 
 ### Auth / API rules (agents)
 
-- **Do not use the `gh` CLI** (`gh api`, `gh auth`, `gh auth token`, etc.).
+- **Do not use the `gh` CLI** (`gh api`, `gh auth`, `gh auth token`, etc.) from these scripts.
 - **Do not use `--token`**, git credential helpers, or hard-coded PATs in commands.
-- Call Dependabot **only** through these skill scripts, which use **GitHub REST** (`fetch` → `https://api.github.com/.../dependabot/alerts`).
-- Ensure the token is available via `.env` / env before running scripts (scripts also auto-load nearest `.env` if env is unset).
+- Call Dependabot **only** through these skill scripts (`fetch` → REST) **or** `--alerts-json`.
+- Under Fullsend (`FULLSEND_OUTPUT_DIR`): use the staged snapshot with `--alerts-json`; do not fetch alerts from the sandbox.
 - Local impact analysis uses **yarn** (`yarn why -R`), not GitHub.
 
 ## Scripts
@@ -137,6 +137,7 @@ Pull open alerts for the workspace and compile the unique package list used for 
 ```bash
 GITHUB_TOKEN=… node "$SKILL_DIR/scripts/list-dependabot-packages.js" <workspace>
 GITHUB_TOKEN=… node "$SKILL_DIR/scripts/list-dependabot-packages.js" <workspace> --json
+node "$SKILL_DIR/scripts/list-dependabot-packages.js" <workspace> --alerts-json /path/to/dependabot-alerts.json
 ```
 
 `<workspace>` may be `homepage`, `workspaces/homepage`, or `workspaces/homepage/yarn.lock`.
@@ -146,16 +147,8 @@ GITHUB_TOKEN=… node "$SKILL_DIR/scripts/list-dependabot-packages.js" <workspac
 | (default) | All open alerts under `workspaces/<name>/` (yarn.lock + package.json manifests) |
 | `--exact-manifest` | Only the exact yarn.lock (or given file) path |
 | `--json` | Packages + alert details |
+| `--alerts-json <file>` | Use a runner snapshot; skip REST and token |
 | (default stdout) | One package name per line (pipe-friendly); summary on stderr |
-
-Examples:
-
-```bash
-GITHUB_TOKEN=… node "$SKILL_DIR/scripts/list-dependabot-packages.js" homepage
-GITHUB_TOKEN=… node "$SKILL_DIR/scripts/list-dependabot-packages.js" homepage --json
-GITHUB_TOKEN=… node "$SKILL_DIR/scripts/list-dependabot-packages.js" \
-  workspaces/homepage/yarn.lock --exact-manifest
-```
 
 When the user names a workspace but does **not** supply a package list, **always start here** — do not invent packages.
 
@@ -196,6 +189,9 @@ GITHUB_TOKEN=… node "$SKILL_DIR/scripts/check-dependabot-patch-status.js" \
 
 GITHUB_TOKEN=… node "$SKILL_DIR/scripts/check-dependabot-patch-status.js" \
   --repo-root /path/to/plugins-repo <workspace> <package> --json
+
+node "$SKILL_DIR/scripts/check-dependabot-patch-status.js" \
+  --repo-root /path/to/plugins-repo --alerts-json /path/to/dependabot-alerts.json <workspace>
 ```
 
 For each package with open alerts, reports:
@@ -424,9 +420,10 @@ Task progress:
       (fetch upstream/main, checkout -B chore/<workspace>-cve-bumps).
       On Fullsend: `prepare-workspace-bump.js --verify-only` (or omit reset;
       auto-selected when FULLSEND_OUTPUT_DIR is set). Use `--dry-run` to preview.
-- [ ] Run list-dependabot-packages.js <workspace> [--json] → package list (REST)
-- [ ] Prefer check-dependabot-patch-status.js <workspace> (markdown table default)
-      OR classify-cve-source.js <workspace> pkg… (table for multiple packages)
+- [ ] Run list-dependabot-packages.js <workspace> [--json] → package list
+      (REST, or `--alerts-json` when a runner snapshot is staged)
+- [ ] Prefer check-dependabot-patch-status.js <workspace> (markdown table default;
+      pass `--alerts-json` under Fullsend). OR classify-cve-source.js <workspace> pkg…
 - [ ] Report classifications to the user as a markdown table (required)
 - [ ] Call out RUNNER_ONLY / PLUGIN_DEV_ONLY / WORKSPACE_DEV_ONLY / PATCHED_EXCEPT_RUNNER / PROD_PATCHED_DEV_UNPATCHED vs PLUGIN_PROD remaining
 - [ ] If packages need bumping: `bump-workspace-packages.js <workspace> [package…]` for
@@ -497,7 +494,3 @@ Also include:
 | Dismiss candidates | policy A/B/C above |
 | Bump result | `bump-workspace-packages.js --json`: `versionsBefore`, `versionsAfter`, `status`, `remaining`, `cvesFixed`, `openCves` |
 | PR body tables | `format-bump-pr.js` from bump `--json` (Fully fixed / Partial leftovers / Unchanged) |
-
-## Installing in Cursor
-
-Copy this directory (include `scripts/`) to `.agents/skills/plugins-package-impact/` or `.cursor/skills/plugins-package-impact/`, or install the pack with `npx skills add`. When classifying, set the agent’s working directory to your target plugins checkout (or pass `--repo-root` / `RHDH_PLUGINS_ROOT`).
