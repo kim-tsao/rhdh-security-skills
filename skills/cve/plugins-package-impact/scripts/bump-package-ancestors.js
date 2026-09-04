@@ -25,8 +25,7 @@ import { promisify } from 'util';
 import { isSkippedBumpPackage } from './bump-skip.js';
 import { isNoMajorBumpPackage, pinMajorJumps } from './same-major-yarn-up.js';
 import { leftoverVersions, cveLeftoverCleared } from './cve-version-status.js';
-import { resolveGithubToken } from './github-auth.js';
-import { resolveGithubRepo } from './github-repo.js';
+import { loadDependabotAlerts } from './dependabot-alerts.js';
 
 const execFile = promisify(execFileCb);
 const NPM_PKG_RE = /((?:@[^/\s]+\/)?[^\s@[]+)@npm:/;
@@ -56,6 +55,7 @@ are out of scope — handle those manually.
 Options:
   --repo-root <path>     Local checkout path (default: cwd walk-up / RHDH_PLUGINS_ROOT)
   --repo <owner/name>    GitHub repo for Dependabot leftover ranges (default: auto-detect)
+  --alerts-json <file>   Snapshot of GitHub Dependabot alert objects (no token)
   --max-parents <number> Max parent packages to try per depth tier (default: 8)
   --max-depth <number>   Max ancestor depth from target (default: 2)
   --fast                 Shorthand for --max-depth 1 --max-parents 4
@@ -74,6 +74,7 @@ function parseArgs(argv) {
   const options = {
     repoRoot: undefined,
     repo: undefined,
+    alertsJson: undefined,
     maxParents: 8,
     maxDepth: 2,
   };
@@ -98,6 +99,11 @@ function parseArgs(argv) {
       options.repo = argv[++i];
       if (!options.repo) {
         throw new Error('--repo requires owner/name');
+      }
+    } else if (arg === '--alerts-json') {
+      options.alertsJson = argv[++i];
+      if (!options.alertsJson) {
+        throw new Error('--alerts-json requires a file path');
       }
     } else if (arg === '--max-parents') {
       const raw = argv[++i];
@@ -341,14 +347,6 @@ function versionsEqual(left, right) {
   return true;
 }
 
-function parseNextLink(linkHeader) {
-  if (!linkHeader) {
-    return null;
-  }
-  const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
-  return match ? match[1] : null;
-}
-
 function summarizeAlert(alert) {
   const vuln = alert.security_vulnerability ?? {};
   return {
@@ -359,53 +357,22 @@ function summarizeAlert(alert) {
   };
 }
 
-async function fetchOpenAlerts({ token, owner, repo }) {
-  const alerts = [];
-  const params = new URLSearchParams({ state: 'open', per_page: '100' });
-  let nextUrl = `https://api.github.com/repos/${owner}/${repo}/dependabot/alerts?${params}`;
-
-  while (nextUrl) {
-    const response = await fetch(nextUrl, {
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${token}`,
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'plugins-package-impact',
-      },
-    });
-    const text = await response.text();
-    let data;
-    try {
-      data = text ? JSON.parse(text) : [];
-    } catch {
-      data = { message: text };
-    }
-    if (!response.ok) {
-      throw new Error(
-        `GitHub API error for ${owner}/${repo} (HTTP ${response.status}): ${data?.message || response.statusText}`,
-      );
-    }
-    if (!Array.isArray(data) || data.length === 0) {
-      break;
-    }
-    alerts.push(...data);
-    nextUrl = parseNextLink(response.headers.get('link'));
-  }
-
-  return alerts;
-}
-
-async function loadPackageAlerts({ repoRoot, workspace, packageName, explicitRepo }) {
+async function loadPackageAlerts({
+  repoRoot,
+  workspace,
+  packageName,
+  explicitRepo,
+  alertsJson,
+}) {
   try {
-    const resolvedRepo = await resolveGithubRepo({
+    const { alerts: all } = await loadDependabotAlerts({
+      alertsJson,
       explicitRepo,
       cwd: repoRoot,
+      state: 'open',
       requiredFor: 'Dependabot leftover ranges',
     });
-    const [owner, repo] = resolvedRepo.split('/');
-    const token = resolveGithubToken({ requiredFor: 'Dependabot leftover ranges' });
     const prefix = `workspaces/${workspace}/`;
-    const all = await fetchOpenAlerts({ token, owner, repo });
     return all
       .filter(a => {
         const manifest = a.dependency?.manifest_path || '';
@@ -539,6 +506,7 @@ async function main() {
     workspace,
     packageName,
     explicitRepo: options.repo,
+    alertsJson: options.alertsJson,
   });
   const beforeWhy = await runYarnWhy(repoRoot, workspaceDir, packageName);
   const versionsBefore = extractResolvedVersions(beforeWhy, packageName);

@@ -308,6 +308,7 @@ specific AWS clients). Handle those by hand after classifying impact.
 node "$SKILL_DIR/scripts/bump-workspace-packages.js" --repo-root /path/to/plugins-repo <workspace>
 node "$SKILL_DIR/scripts/bump-workspace-packages.js" --repo-root /path/to/plugins-repo <workspace> <package>…
 node "$SKILL_DIR/scripts/bump-workspace-packages.js" --repo-root /path/to/plugins-repo <workspace> --json
+node "$SKILL_DIR/scripts/bump-workspace-packages.js" --repo-root /path/to/plugins-repo --alerts-json /path/to/dependabot-alerts.json <workspace> --json
 node "$SKILL_DIR/scripts/bump-workspace-packages.js" --repo-root /path/to/plugins-repo <workspace> <package> --dry-run
 ```
 
@@ -315,6 +316,7 @@ node "$SKILL_DIR/scripts/bump-workspace-packages.js" --repo-root /path/to/plugin
 |------|---------|--------|
 | `--repo-root <path>` | cwd walk-up / `RHDH_PLUGINS_ROOT` | Local plugins monorepo checkout |
 | `--repo <owner/name>` | auto-detect | GitHub repo for Dependabot CVE metadata |
+| `--alerts-json <file>` | — | Use a runner snapshot; skip REST and token |
 | `--dry-run` | off | Report only; no `yarn up` / `install` / `dedupe` |
 | `--no-dedupe` | off | Skip `yarn dedupe` after `yarn install` |
 | `--no-ancestors` | off | Skip allowlisted leftover ancestor bumps (`qs`) |
@@ -356,6 +358,9 @@ After a bump, pipe `--json` into `format-bump-pr.js` for the PR description. It 
 
 ```bash
 node "$SKILL_DIR/scripts/bump-workspace-packages.js" --repo-root /path/to/plugins-repo <workspace> --json \
+  | node "$SKILL_DIR/scripts/format-bump-pr.js"
+node "$SKILL_DIR/scripts/bump-workspace-packages.js" --repo-root /path/to/plugins-repo \
+  --alerts-json /path/to/dependabot-alerts.json <workspace> --json \
   | node "$SKILL_DIR/scripts/format-bump-pr.js"
 node "$SKILL_DIR/scripts/format-bump-pr.js" --with-title bump.json
 node "$SKILL_DIR/scripts/format-bump-pr.js" --title bump.json
@@ -428,6 +433,7 @@ Task progress:
 - [ ] Call out RUNNER_ONLY / PLUGIN_DEV_ONLY / WORKSPACE_DEV_ONLY / PATCHED_EXCEPT_RUNNER / PROD_PATCHED_DEV_UNPATCHED vs PLUGIN_PROD remaining
 - [ ] If packages need bumping: `bump-workspace-packages.js <workspace> [package…]` for
       bare `yarn up -R` + `yarn install` + `yarn dedupe` + CVE summary table.
+      Under Fullsend, pass `--alerts-json` with the staged snapshot (no PAT in sandbox).
       Known no-major-bump packages (`http-proxy-middleware`) are re-pinned if
       they jump majors. Allowlisted leftovers (see `ancestor-allowlist.js`) are
       ancestor-bumped automatically when a CVE-vulnerable resolved version

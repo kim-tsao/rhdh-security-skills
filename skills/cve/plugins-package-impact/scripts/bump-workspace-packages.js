@@ -23,8 +23,7 @@ import { dirname, resolve as resolvePath } from 'path';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
 
-import { resolveGithubToken } from './github-auth.js';
-import { resolveGithubRepo } from './github-repo.js';
+import { loadDependabotAlerts } from './dependabot-alerts.js';
 import { isSkippedBumpPackage, skipReason } from './bump-skip.js';
 import { isAncestorAutoPackage } from './ancestor-allowlist.js';
 import {
@@ -51,7 +50,6 @@ import { isNoMajorBumpPackage, pinMajorJumps } from './same-major-yarn-up.js';
 
 const execFile = promisify(execFileCb);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const API_BASE = 'https://api.github.com';
 
 function usage() {
   console.error(`Usage: bump-workspace-packages.js [options] <workspace> [package...]
@@ -79,6 +77,7 @@ same-major version via yarn set resolution when they still disagree.
 Options:
   --repo-root <path>   Local checkout path (default: cwd walk-up / RHDH_PLUGINS_ROOT)
   --repo <owner/name>  GitHub repo for Dependabot alerts (default: auto-detect)
+  --alerts-json <file> Snapshot of GitHub Dependabot alert objects (no token)
   --json               Machine-readable JSON on stdout
   --dry-run            Report only; do not run yarn up, install, or dedupe
   --no-dedupe          Skip yarn dedupe after yarn install
@@ -88,6 +87,7 @@ Options:
 Examples:
   node bump-workspace-packages.js --repo-root /path/to/plugins-repo boost
   node bump-workspace-packages.js boost adm-zip ws --json
+  node bump-workspace-packages.js --repo-root /path/to/plugins-repo --alerts-json /tmp/dependabot-alerts.json homepage --json
   node bump-workspace-packages.js boost prismjs --dry-run
 `);
 }
@@ -97,6 +97,7 @@ function parseArgs(argv) {
   const options = {
     repoRoot: undefined,
     repo: undefined,
+    alertsJson: undefined,
   };
   const positional = [];
 
@@ -121,6 +122,11 @@ function parseArgs(argv) {
       options.repo = argv[++i];
       if (!options.repo) {
         throw new Error('--repo requires owner/name');
+      }
+    } else if (arg === '--alerts-json') {
+      options.alertsJson = argv[++i];
+      if (!options.alertsJson) {
+        throw new Error('--alerts-json requires a file path');
       }
     } else if (arg.startsWith('-')) {
       throw new Error(`Unknown option: ${arg}`);
@@ -164,22 +170,6 @@ function findRepoRoot(explicitRoot) {
   throw new Error(
     'Could not find repo root. Pass --repo-root or set RHDH_PLUGINS_ROOT.',
   );
-}
-
-function parseOwnerRepo(repo) {
-  const [owner, name, ...rest] = repo.split('/');
-  if (!owner || !name || rest.length) {
-    throw new Error(`Invalid --repo "${repo}"; expected owner/name`);
-  }
-  return { owner, repo: name, full: `${owner}/${name}` };
-}
-
-function parseNextLink(linkHeader) {
-  if (!linkHeader) {
-    return null;
-  }
-  const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
-  return match ? match[1] : null;
 }
 
 function loadSemver(repoRoot) {
@@ -235,42 +225,6 @@ function summarizeAlert(alert) {
     ghsa: alert.security_advisory?.ghsa_id ?? null,
     cve: alert.security_advisory?.cve_id ?? null,
   };
-}
-
-async function fetchOpenAlerts({ token, owner, repo }) {
-  const alerts = [];
-  const params = new URLSearchParams({ state: 'open', per_page: '100' });
-  let nextUrl = `${API_BASE}/repos/${owner}/${repo}/dependabot/alerts?${params}`;
-
-  while (nextUrl) {
-    const response = await fetch(nextUrl, {
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${token}`,
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'plugins-package-impact',
-      },
-    });
-    const text = await response.text();
-    let data;
-    try {
-      data = text ? JSON.parse(text) : [];
-    } catch {
-      data = { message: text };
-    }
-    if (!response.ok) {
-      throw new Error(
-        `GitHub API error for ${owner}/${repo} (HTTP ${response.status}): ${data?.message || response.statusText}`,
-      );
-    }
-    if (!Array.isArray(data) || data.length === 0) {
-      break;
-    }
-    alerts.push(...data);
-    nextUrl = parseNextLink(response.headers.get('link'));
-  }
-
-  return alerts;
 }
 
 async function resolveYarnInvocation(repoRoot) {
@@ -365,11 +319,14 @@ async function alignReactRouterPair(
   };
 }
 
-async function runAncestorBump(repoRoot, workspace, packageName, repo) {
+async function runAncestorBump(repoRoot, workspace, packageName, repo, alertsJson) {
   const script = resolvePath(__dirname, 'bump-package-ancestors.js');
   const args = [script, '--repo-root', repoRoot];
   if (repo) {
     args.push('--repo', repo);
+  }
+  if (alertsJson) {
+    args.push('--alerts-json', alertsJson);
   }
   args.push(workspace, packageName, '--json');
   const { stdout } = await execFile(process.execPath, args, {
@@ -544,18 +501,21 @@ async function main() {
     throw new Error(`No yarn.lock in workspaces/${workspace}`);
   }
 
-  const resolvedRepo = await resolveGithubRepo({
+  const {
+    alerts: allAlerts,
+    repo: repoFull,
+    fromSnapshot,
+  } = await loadDependabotAlerts({
+    alertsJson: options.alertsJson,
     explicitRepo: options.repo,
     cwd: repoRoot,
+    state: 'open',
     requiredFor: 'Dependabot alerts read',
   });
-  const { owner, repo, full: repoFull } = parseOwnerRepo(resolvedRepo);
-  const token = resolveGithubToken({ requiredFor: 'Dependabot alerts read' });
   const semver = loadSemver(repoRoot);
   const dryRun = flags.has('dry-run');
 
   const prefix = `workspaces/${workspace}/`;
-  const allAlerts = await fetchOpenAlerts({ token, owner, repo });
   const workspaceAlerts = allAlerts.filter(a => {
     const manifest = a.dependency?.manifest_path || '';
     return manifest === 'yarn.lock'
@@ -697,6 +657,7 @@ async function main() {
           workspace,
           packageName,
           repoFull,
+          options.alertsJson,
         );
         lockAfterUp = await readFile(lockPath, 'utf8');
       } catch (error) {
@@ -789,6 +750,7 @@ async function main() {
 
   const output = {
     repo: repoFull,
+    source: fromSnapshot ? 'alerts-json' : 'github-rest',
     workspace,
     repoRoot,
     dryRun,
