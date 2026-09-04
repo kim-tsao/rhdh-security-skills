@@ -348,7 +348,7 @@ Behavior:
 6. Classifies each package and compares before/after versions against open advisory ranges.
 7. Prints a table: `package`, `classification`, `status`, `versions_before`, `versions_after`, `first_patched`, `open_cves`, `cves_fixed`.
 
-`status` values: `fixed` (all vulnerable resolved versions cleared), `partial`, `unchanged`, `updated`, `skipped` (`@backstage/*` / `@backstage-community/*` denylist), `dry-run`, `error`.
+`status` values: `fixed` (all vulnerable resolved versions cleared), `partial`, `unchanged`, `updated`, `skipped` (`@backstage/*` / `@backstage-community/*` denylist), `dry-run`, `error` (lockfile still vulnerable after the full bump pipeline — a non-zero `yarn up -R` exit alone does not set `error` when install/dedupe/ancestors already fixed the lockfile).
 
 `--json` also includes `remaining` (after versions still in an open advisory range) and compact `alerts` (`ghsa`, `cve`, `vulnerableRange`, `firstPatched`) per package. Use that JSON for PR body tables — do not paste the bump script’s combined `status` table into the PR.
 

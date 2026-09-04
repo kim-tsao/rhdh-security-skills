@@ -394,6 +394,29 @@ function cvesFixed(semver, alerts, versionsBefore, versionsAfter) {
   return [...new Set(fixed)].sort();
 }
 
+function lockfileOutcomeStatus({
+  versionsBefore,
+  versionsAfter,
+  semver,
+  alerts,
+}) {
+  if (versionsEqual(versionsBefore, versionsAfter)) {
+    return 'unchanged';
+  }
+  const vulnerableBefore = anyVersionVulnerable(semver, versionsBefore, alerts);
+  const vulnerableAfter = anyVersionVulnerable(semver, versionsAfter, alerts);
+  if (vulnerableBefore && !vulnerableAfter) {
+    return 'fixed';
+  }
+  if (vulnerableBefore && vulnerableAfter) {
+    return 'partial';
+  }
+  if (!vulnerableBefore && !vulnerableAfter) {
+    return 'updated';
+  }
+  return 'updated';
+}
+
 function bumpStatus({
   dryRun,
   skipped,
@@ -409,24 +432,33 @@ function bumpStatus({
   if (dryRun) {
     return 'dry-run';
   }
-  if (yarnError) {
+
+  const outcome = lockfileOutcomeStatus({
+    versionsBefore,
+    versionsAfter,
+    semver,
+    alerts,
+  });
+
+  if (!yarnError) {
+    return outcome;
+  }
+
+  // `yarn up -R` can exit non-zero while stderr only carries warnings, or fail
+  // for one package while a later install / dedupe / ancestor pass still moves
+  // the lockfile. Base status on the final lockfile, not the up exit code.
+  if (outcome !== 'unchanged') {
+    return outcome;
+  }
+
+  if (
+    alerts.length > 0 &&
+    anyVersionVulnerable(semver, versionsAfter, alerts)
+  ) {
     return 'error';
   }
-  if (versionsEqual(versionsBefore, versionsAfter)) {
-    return 'unchanged';
-  }
-  const vulnerableBefore = anyVersionVulnerable(semver, versionsBefore, alerts);
-  const vulnerableAfter = anyVersionVulnerable(semver, versionsAfter, alerts);
-  if (vulnerableBefore && !vulnerableAfter) {
-    return 'fixed';
-  }
-  if (vulnerableBefore && vulnerableAfter) {
-    return 'partial';
-  }
-  if (!vulnerableBefore && !vulnerableAfter) {
-    return versionsEqual(versionsBefore, versionsAfter) ? 'unchanged' : 'updated';
-  }
-  return 'updated';
+
+  return 'unchanged';
 }
 
 function escapeMarkdownCell(value) {
@@ -721,6 +753,7 @@ async function main() {
       .filter(a => a.dependency?.package?.name === packageName)
       .map(summarizeAlert);
     const classification = await runClassify(repoRoot, workspace, packageName);
+    const upYarnError = yarnErrors[packageName];
     const status = bumpStatus({
       dryRun,
       skipped,
@@ -728,7 +761,7 @@ async function main() {
       versionsAfter,
       semver,
       alerts: pkgAlerts,
-      yarnError: yarnErrors[packageName],
+      yarnError: upYarnError,
     });
 
     const row = buildRow({
@@ -739,7 +772,7 @@ async function main() {
       alerts: pkgAlerts,
       semver,
       status,
-      yarnError: yarnErrors[packageName],
+      yarnError: status === 'error' ? upYarnError : null,
       ancestorAuto: ancestorAuto[packageName],
     });
     if (majorPinsByPackage[packageName]) {
@@ -854,7 +887,10 @@ async function main() {
     }
   }
 
-  const failed = results.filter(r => r.yarnError);
+  const failed = results.filter(r => r.status === 'error' && r.yarnError);
+  const recoveredUp = results.filter(
+    r => r.status !== 'error' && yarnErrors[r.package],
+  );
   const hygieneErrors = [
     yarnErrors.__install && ['install', yarnErrors.__install],
     yarnErrors.__dedupe && ['dedupe', yarnErrors.__dedupe],
@@ -870,6 +906,15 @@ async function main() {
     }
     for (const [step, message] of hygieneErrors) {
       console.log(`  • ${step}: ${message}`);
+    }
+  }
+  if (recoveredUp.length) {
+    console.log('');
+    console.log(
+      'Yarn up recovered (non-zero exit, lockfile outcome OK after install/dedupe/ancestors):',
+    );
+    for (const r of recoveredUp) {
+      console.log(`  • ${r.package}: ${yarnErrors[r.package]}`);
     }
   }
 }
