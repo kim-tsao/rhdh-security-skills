@@ -16,7 +16,8 @@
 
 /**
  * Leftover packages that bump-workspace-packages.js may ancestor-bump
- * automatically after yarn up -R.
+ * automatically after yarn up -R (including when yarn install failed but
+ * CVE-vulnerable leftovers remain).
  *
  * Allowlist a package only when all of these hold across workspaces:
  * - yarn up -R leaves a leftover held by a parent (a second resolved line,

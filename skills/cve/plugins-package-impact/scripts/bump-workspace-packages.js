@@ -255,6 +255,29 @@ async function runYarn(repoRoot, cwd, args) {
   return { stdout, stderr };
 }
 
+function yarnFailureMessage(error) {
+  return error.stderr?.toString().trim() || error.message;
+}
+
+/** Run yarn install in the workspace; retry once on failure. */
+async function runWorkspaceInstall(repoRoot, workspaceDir) {
+  let retried = false;
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await runYarn(repoRoot, workspaceDir, ['install']);
+      return { ok: true, error: null, retried };
+    } catch (error) {
+      lastError = yarnFailureMessage(error);
+      if (attempt === 0) {
+        retried = true;
+        continue;
+      }
+    }
+  }
+  return { ok: false, error: lastError, retried };
+}
+
 /**
  * After yarn up -R, force react-router-dom descriptors onto react-router's
  * same-major version when highs still disagree (lockfile-only resolutions).
@@ -596,6 +619,7 @@ async function main() {
   const yarnErrors = {};
   const skippedPackages = {};
   const majorPinsByPackage = {};
+  let installRetried = false;
   if (!dryRun) {
     for (const packageName of packageNames) {
       if (isSkippedBumpPackage(packageName)) {
@@ -609,8 +633,7 @@ async function main() {
       try {
         await runYarn(repoRoot, workspaceDir, ['up', '-R', packageName]);
       } catch (error) {
-        yarnErrors[packageName] =
-          error.stderr?.toString().trim() || error.message;
+        yarnErrors[packageName] = yarnFailureMessage(error);
         continue;
       }
       if (needsMajorPin) {
@@ -627,25 +650,22 @@ async function main() {
             majorPinsByPackage[packageName] = pinResult.pins;
           }
         } catch (error) {
-          yarnErrors[`${packageName}__majorPin`] =
-            error.stderr?.toString().trim() || error.message;
+          yarnErrors[`${packageName}__majorPin`] = yarnFailureMessage(error);
         }
       }
     }
     const attemptedUp = packageNames.some(name => !skippedPackages[name]);
     if (attemptedUp) {
-      try {
-        await runYarn(repoRoot, workspaceDir, ['install']);
-      } catch (error) {
-        yarnErrors.__install =
-          error.stderr?.toString().trim() || error.message;
+      const installResult = await runWorkspaceInstall(repoRoot, workspaceDir);
+      installRetried = installResult.retried;
+      if (!installResult.ok) {
+        yarnErrors.__install = installResult.error;
       }
       if (!flags.has('no-dedupe') && !yarnErrors.__install) {
         try {
           await runYarn(repoRoot, workspaceDir, ['dedupe']);
         } catch (error) {
-          yarnErrors.__dedupe =
-            error.stderr?.toString().trim() || error.message;
+          yarnErrors.__dedupe = yarnFailureMessage(error);
         }
       }
     }
@@ -658,11 +678,8 @@ async function main() {
   }
 
   const ancestorAuto = {};
-  if (
-    !dryRun &&
-    !flags.has('no-ancestors') &&
-    !yarnErrors.__install
-  ) {
+  const installFailed = Boolean(yarnErrors.__install);
+  if (!dryRun && !flags.has('no-ancestors')) {
     let lockAfterUp = await readFile(lockPath, 'utf8');
     for (const packageName of packageNames) {
       if (
@@ -693,8 +710,7 @@ async function main() {
         );
         lockAfterUp = await readFile(lockPath, 'utf8');
       } catch (error) {
-        yarnErrors[`${packageName}__ancestor`] =
-          error.stderr?.toString().trim() || error.message;
+        yarnErrors[`${packageName}__ancestor`] = yarnFailureMessage(error);
       }
     }
   }
@@ -781,6 +797,9 @@ async function main() {
     results.push(row);
   }
 
+  const ancestorsDespiteInstallFailure =
+    installFailed && Object.keys(ancestorAuto).length > 0;
+
   const output = {
     repo: repoFull,
     source: fromSnapshot ? 'alerts-json' : 'github-rest',
@@ -791,12 +810,16 @@ async function main() {
       !dryRun &&
       packageNames.some(name => !skippedPackages[name]) &&
       !yarnErrors.__install,
+    installError: yarnErrors.__install || null,
+    installRetried,
     deduped:
       !dryRun &&
       packageNames.some(name => !skippedPackages[name]) &&
       !flags.has('no-dedupe') &&
       !yarnErrors.__install &&
       !yarnErrors.__dedupe,
+    dedupeError: yarnErrors.__dedupe || null,
+    ancestorsDespiteInstallFailure,
     skippedPackages: Object.keys(skippedPackages).sort(),
     ancestorAutoPackages: Object.keys(ancestorAuto).sort(),
     reactRouterPairAdded,
@@ -854,11 +877,21 @@ async function main() {
   if (ancestorRows.length) {
     console.log('');
     console.log('Allowlisted leftover ancestor bumps:');
+    if (installFailed) {
+      console.log(
+        '  (yarn install failed; ancestor bumps still ran for allowlisted leftovers)',
+      );
+    }
     for (const r of ancestorRows) {
       console.log(
         `  • ${r.package}: ${r.ancestorComplete ? 'complete' : 'attempted'}`,
       );
     }
+  } else if (installFailed && !flags.has('no-ancestors')) {
+    console.log('');
+    console.log(
+      'Allowlisted ancestor bumps: skipped (no CVE leftovers on allowlist packages)',
+    );
   }
 
   if (reactRouterPairAdded.length || reactRouterPairAlign?.aligned) {

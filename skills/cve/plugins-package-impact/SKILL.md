@@ -330,16 +330,18 @@ Behavior:
    runs bare `yarn up -R <package>` (Yarn forbids ranges with `-R`). For **known
    no-major-bump packages** (currently `http-proxy-middleware`), if a descriptor
    major-jumped (e.g. `*` 3 → 4), re-pins it to the latest prior major via
-   `yarn set resolution`. Then `yarn install` and `yarn dedupe` (unless
-   `--no-dedupe` skips the dedupe step). This matches rhdh-plugins
-   `.fullsend/AGENTS.md`: install then dedupe so the lockfile is clean for CI
-   `--immutable`.
+   `yarn set resolution`. Then `yarn install` (retried once on failure) and
+   `yarn dedupe` (unless `--no-dedupe` skips the dedupe step). This matches
+   rhdh-plugins `.fullsend/AGENTS.md`: install then dedupe so the lockfile is
+   clean for CI `--immutable`.
 4. If an **allowlisted leftover** (see `ancestor-allowlist.js`) still has a
    CVE-vulnerable resolved version after `yarn up -R` — a second lockfile line
    **or** a single parent-held unpatched pin — runs `bump-package-ancestors.js`
-   for that package automatically. A single **patched** line is done; do not
-   walk parents. Pass `--no-ancestors` to skip. Other leftover packages are
-   **not** a cue to walk parents — those ancestor bumps stay opt-in (see 5c).
+   for that package automatically (**even when step 3 `yarn install` failed** —
+   parent bumps snapshot/revert the lockfile). A single **patched** line is
+   done; do not walk parents. Pass `--no-ancestors` to skip. Other leftover
+   packages are **not** a cue to walk parents — those ancestor bumps stay
+   opt-in (see 5c).
 5. **react-router pair sync:** if the bump set includes `react-router` or
    `react-router-dom` and the other is in the lockfile, both are bumped. After
    the steps above, if same-major highs still disagree, `react-router-dom` is
@@ -350,7 +352,7 @@ Behavior:
 
 `status` values: `fixed` (all vulnerable resolved versions cleared), `partial`, `unchanged`, `updated`, `skipped` (`@backstage/*` / `@backstage-community/*` denylist), `dry-run`, `error` (lockfile still vulnerable after the full bump pipeline — a non-zero `yarn up -R` exit alone does not set `error` when install/dedupe/ancestors already fixed the lockfile).
 
-`--json` also includes `remaining` (after versions still in an open advisory range) and compact `alerts` (`ghsa`, `cve`, `vulnerableRange`, `firstPatched`) per package. Use that JSON for PR body tables — do not paste the bump script’s combined `status` table into the PR.
+`--json` also includes `remaining` (after versions still in an open advisory range), compact `alerts` (`ghsa`, `cve`, `vulnerableRange`, `firstPatched`) per package, and hygiene fields `installError`, `installRetried`, `dedupeError`, `ancestorsDespiteInstallFailure`. Use that JSON for PR body tables — do not paste the bump script’s combined `status` table into the PR.
 
 ### 5b. PR body tables (`format-bump-pr.js`)
 
