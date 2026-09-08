@@ -352,10 +352,26 @@ async function runAncestorBump(repoRoot, workspace, packageName, repo, alertsJso
     args.push('--alerts-json', alertsJson);
   }
   args.push(workspace, packageName, '--json');
-  const { stdout } = await execFile(process.execPath, args, {
-    maxBuffer: 20 * 1024 * 1024,
-  });
-  return JSON.parse(stdout);
+  try {
+    const { stdout } = await execFile(process.execPath, args, {
+      maxBuffer: 20 * 1024 * 1024,
+    });
+    return JSON.parse(stdout);
+  } catch (error) {
+    const stdout = error.stdout?.toString().trim();
+    if (stdout) {
+      try {
+        return JSON.parse(stdout);
+      } catch {
+        // fall through
+      }
+    }
+    return {
+      complete: false,
+      error: yarnFailureMessage(error),
+      subprocessFailed: true,
+    };
+  }
 }
 
 async function runClassify(repoRoot, workspace, packageName) {
@@ -527,8 +543,15 @@ function buildRow({
     cvesFixed: fixed,
     alerts: compactAlerts(alerts),
     yarnError: yarnError || null,
-    ancestorAuto: Boolean(ancestorAuto),
+    ancestorAuto: ancestorAuto != null,
     ancestorComplete: ancestorAuto?.complete ?? null,
+    ancestorReverted: ancestorAuto?.reverted ?? null,
+    ancestorBlockedReason: ancestorAuto?.blockedReason ?? null,
+    ancestorError:
+      ancestorAuto?.error ||
+      ancestorAuto?.yarnWhyError ||
+      ancestorAuto?.prepInstallError ||
+      null,
     skipReason: skipReason(packageName),
   };
 }
@@ -710,7 +733,11 @@ async function main() {
         );
         lockAfterUp = await readFile(lockPath, 'utf8');
       } catch (error) {
-        yarnErrors[`${packageName}__ancestor`] = yarnFailureMessage(error);
+        ancestorAuto[packageName] = {
+          complete: false,
+          error: yarnFailureMessage(error),
+          subprocessFailed: true,
+        };
       }
     }
   }

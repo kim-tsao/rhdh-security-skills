@@ -196,6 +196,10 @@ async function runYarn(repoRoot, cwd, args) {
   return { stdout, stderr };
 }
 
+function yarnFailureMessage(error) {
+  return error.stderr?.toString().trim() || error.message;
+}
+
 async function runYarnWhy(repoRoot, workspaceDir, packageName) {
   try {
     const { stdout } = await runYarn(repoRoot, workspaceDir, ['why', '-R', packageName]);
@@ -206,9 +210,137 @@ async function runYarnWhy(repoRoot, workspaceDir, packageName) {
     }
     return stdout;
   } catch (error) {
-    const message = error.stderr?.toString().trim() || error.message;
-    throw new Error(`yarn why -R ${packageName} failed: ${message}`);
+    throw new Error(`yarn why -R ${packageName} failed: ${yarnFailureMessage(error)}`);
   }
+}
+
+function resolvedVersionsFromLockfile(lockfileText, packageName) {
+  const versions = new Set();
+  const escaped = packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const blockRe = new RegExp(`^"${escaped}@[^"]+":\\n((?:  .*\\n)*)`, 'gm');
+  let match;
+  while ((match = blockRe.exec(lockfileText)) !== null) {
+    const ver = match[1].match(/^  version: (.+)$/m);
+    if (ver) {
+      versions.add(ver[1].trim().replace(/^["']|["']$/g, ''));
+    }
+  }
+  return [...versions].sort();
+}
+
+function packageVersionFromLockfile(lockfileText, packageName) {
+  const versions = resolvedVersionsFromLockfile(lockfileText, packageName);
+  return versions.length === 1 ? versions[0] : null;
+}
+
+/** Direct lockfile dependents when yarn why is unavailable (e.g. after failed install). */
+function parentDepSpecFromLockfile(lockfileText, parent, packageName) {
+  const escapedParent = parent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const blockRe = new RegExp(
+    `"${escapedParent}@npm:[^"]*":\\n((?:  .*\\n)*)`,
+    'm',
+  );
+  const match = lockfileText.match(blockRe);
+  if (!match) {
+    return null;
+  }
+  const escapedPkg = packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const depMatch = match[1].match(
+    new RegExp(`^    ${escapedPkg}: "npm:([^"]+)"`, 'm'),
+  );
+  return depMatch ? depMatch[1] : null;
+}
+
+function parentLeftoverScore(semver, lockfileText, parent, packageName, leftovers) {
+  const depSpec = parentDepSpecFromLockfile(lockfileText, parent, packageName);
+  if (!depSpec || !leftovers.length) {
+    return 0;
+  }
+  let score = 0;
+  for (const version of leftovers) {
+    const coerced = semver.coerce(version)?.version;
+    if (!coerced) {
+      continue;
+    }
+    try {
+      if (semver.satisfies(coerced, depSpec, { includePrerelease: true })) {
+        score += 1;
+      }
+    } catch {
+      // ignore unparseable ranges
+    }
+  }
+  return score;
+}
+
+function rankParentsByLeftoverHold({
+  semver,
+  lockfileText,
+  packageName,
+  parents,
+  leftovers,
+}) {
+  return [...parents].sort((left, right) => {
+    const leftScore = parentLeftoverScore(
+      semver,
+      lockfileText,
+      left,
+      packageName,
+      leftovers,
+    );
+    const rightScore = parentLeftoverScore(
+      semver,
+      lockfileText,
+      right,
+      packageName,
+      leftovers,
+    );
+    if (leftScore !== rightScore) {
+      return rightScore - leftScore;
+    }
+    return left.localeCompare(right);
+  });
+}
+
+function findLockfileParents(lockfileText, packageName) {
+  const parents = new Set();
+  const escapedDep = packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const depLineRe = new RegExp(`^    ${escapedDep}: "npm:[^"]+"`, 'm');
+  const blockRe = /^"([^"]+)":\n((?:  .*\n)*)/gm;
+  let match;
+  while ((match = blockRe.exec(lockfileText)) !== null) {
+    const header = match[1];
+    const body = match[2];
+    if (!depLineRe.test(body)) {
+      continue;
+    }
+    for (const part of header.split(', ')) {
+      const pkgMatch = part.match(NPM_PKG_RE);
+      if (
+        pkgMatch &&
+        pkgMatch[1] !== packageName &&
+        !isDisallowedParentPackage(pkgMatch[1])
+      ) {
+        parents.add(pkgMatch[1]);
+      }
+    }
+  }
+  return [...parents].sort();
+}
+
+async function ensureWorkspaceInstall(repoRoot, workspaceDir) {
+  let retried = false;
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await runYarn(repoRoot, workspaceDir, ['install']);
+      return { ok: true, error: null, retried };
+    } catch (error) {
+      lastError = yarnFailureMessage(error);
+      retried = attempt > 0;
+    }
+  }
+  return { ok: false, error: lastError, retried };
 }
 
 function extractResolvedVersions(whyOutput, packageName) {
@@ -316,11 +448,29 @@ function loadSemver(repoRoot) {
 async function updatePackage(repoRoot, workspaceDir, packageName, semver) {
   const lockPath = resolvePath(workspaceDir, 'yarn.lock');
   const lockBefore = await readFile(lockPath, 'utf8');
-  await runYarn(repoRoot, workspaceDir, ['up', '-R', packageName]);
+  const versionBefore = packageVersionFromLockfile(lockBefore, packageName);
+  try {
+    await runYarn(repoRoot, workspaceDir, ['up', '-R', packageName]);
+  } catch (error) {
+    throw new Error(
+      `yarn up -R ${packageName} failed: ${yarnFailureMessage(error)}`,
+    );
+  }
+  let lockAfter = await readFile(lockPath, 'utf8');
+  const versionAfterRecursive = packageVersionFromLockfile(lockAfter, packageName);
+  if (versionBefore && versionAfterRecursive === versionBefore) {
+    try {
+      await runYarn(repoRoot, workspaceDir, ['up', packageName]);
+      lockAfter = await readFile(lockPath, 'utf8');
+    } catch (error) {
+      throw new Error(
+        `yarn up ${packageName} failed after -R made no change: ${yarnFailureMessage(error)}`,
+      );
+    }
+  }
   if (!isNoMajorBumpPackage(packageName)) {
     return;
   }
-  const lockAfter = await readFile(lockPath, 'utf8');
   await pinMajorJumps({
     semver,
     packageName,
@@ -330,9 +480,27 @@ async function updatePackage(repoRoot, workspaceDir, packageName, semver) {
   });
 }
 
-async function refreshLockfile(repoRoot, workspaceDir) {
-  await runYarn(repoRoot, workspaceDir, ['install']);
-  await runYarn(repoRoot, workspaceDir, ['dedupe']);
+async function refreshLockfileResilient(repoRoot, workspaceDir) {
+  const install = await ensureWorkspaceInstall(repoRoot, workspaceDir);
+  if (!install.ok) {
+    return {
+      ok: false,
+      installError: install.error,
+      installRetried: install.retried,
+      dedupeError: null,
+    };
+  }
+  try {
+    await runYarn(repoRoot, workspaceDir, ['dedupe']);
+    return { ok: true, installError: null, installRetried: install.retried, dedupeError: null };
+  } catch (error) {
+    return {
+      ok: false,
+      installError: null,
+      installRetried: install.retried,
+      dedupeError: yarnFailureMessage(error),
+    };
+  }
 }
 
 function versionsEqual(left, right) {
@@ -425,25 +593,47 @@ function hasDisallowedOnlyParents(whyOutput, packageName, maxDepth) {
 
 function getCandidatesForDepth({
   whyOutput,
+  lockfileText,
   packageName,
   depth,
   maxParents,
   visitedParents,
+  semver,
+  alerts,
+  versionsCurrent,
 }) {
-  const byDepth = findParentsByDepth(whyOutput, packageName);
-  return [...(byDepth.get(depth) || [])]
+  const byDepth = findParentsByDepth(whyOutput || '', packageName);
+  let candidates = [...(byDepth.get(depth) || [])];
+  if (!candidates.length && depth === 1 && lockfileText) {
+    candidates = findLockfileParents(lockfileText, packageName);
+  }
+  const filtered = candidates
     .filter(parent => !isDisallowedParentPackage(parent))
-    .filter(parent => !visitedParents.has(parent))
-    .sort()
-    .slice(0, maxParents);
+    .filter(parent => !visitedParents.has(parent));
+  const leftovers = leftoverVersions(semver, alerts, versionsCurrent);
+  return rankParentsByLeftoverHold({
+    semver,
+    lockfileText,
+    packageName,
+    parents: filtered,
+    leftovers,
+  }).slice(0, maxParents);
 }
 
-async function refreshTargetState(repoRoot, workspaceDir, packageName) {
-  const why = await runYarnWhy(repoRoot, workspaceDir, packageName);
-  return {
-    why,
-    versions: extractResolvedVersions(why, packageName),
-  };
+async function readTargetState(repoRoot, workspaceDir, packageName, lockPath) {
+  const lockfileText = await readFile(lockPath, 'utf8');
+  let why = '';
+  let whyError = null;
+  try {
+    why = await runYarnWhy(repoRoot, workspaceDir, packageName);
+  } catch (error) {
+    whyError = yarnFailureMessage(error);
+  }
+  const fromWhy = why ? extractResolvedVersions(why, packageName) : [];
+  const versions = fromWhy.length
+    ? fromWhy
+    : resolvedVersionsFromLockfile(lockfileText, packageName);
+  return { why, versions, lockfileText, whyError };
 }
 
 async function snapshotLockfile(lockPath) {
@@ -508,28 +698,72 @@ async function main() {
     explicitRepo: options.repo,
     alertsJson: options.alertsJson,
   });
-  const beforeWhy = await runYarnWhy(repoRoot, workspaceDir, packageName);
-  const versionsBefore = extractResolvedVersions(beforeWhy, packageName);
 
-  const attempts = [];
   const dryRun = flags.has('dry-run');
   const fast = flags.has('fast');
+  let prepInstallError = null;
+  let prepInstallRetried = false;
+  if (!dryRun) {
+    const prep = await ensureWorkspaceInstall(repoRoot, workspaceDir);
+    prepInstallError = prep.error;
+    prepInstallRetried = prep.retried;
+  }
+
+  let {
+    why: beforeWhy,
+    versions: versionsBefore,
+    lockfileText,
+    whyError: initialWhyError,
+  } = await readTargetState(repoRoot, workspaceDir, packageName, lockPath);
+  if (!versionsBefore.length) {
+    const result = {
+      workspace,
+      package: packageName,
+      repoRoot,
+      dryRun,
+      error: initialWhyError || `no resolved ${packageName} versions in lockfile`,
+      versionsBefore: [],
+      versionsAfter: [],
+      complete: false,
+      blockedReason: 'no_target_versions',
+      attempts: [{ type: 'blocked', reason: 'no_target_versions' }],
+    };
+    if (flags.has('json')) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.error(`Error: ${result.error}`);
+    process.exit(1);
+  }
+
+  const attempts = [];
   let blockedReason = null;
 
   let currentWhy = beforeWhy;
+  let lockfileSnapshot = lockfileText;
   let versionsCurrent = [...versionsBefore];
+  let currentWhyError = initialWhyError;
 
   const isComplete = versions =>
     isUpdateComplete(versionsBefore, versions, semver, alerts);
 
   if (!dryRun) {
-    await updatePackage(repoRoot, workspaceDir, packageName, semver);
-    ({ why: currentWhy, versions: versionsCurrent } = await refreshTargetState(
-      repoRoot,
-      workspaceDir,
-      packageName,
-    ));
-    attempts.push({ type: 'target', package: packageName });
+    try {
+      await updatePackage(repoRoot, workspaceDir, packageName, semver);
+      attempts.push({ type: 'target', package: packageName });
+    } catch (error) {
+      attempts.push({
+        type: 'target',
+        package: packageName,
+        error: yarnFailureMessage(error),
+      });
+    }
+    ({
+      why: currentWhy,
+      versions: versionsCurrent,
+      lockfileText: lockfileSnapshot,
+      whyError: currentWhyError,
+    } = await readTargetState(repoRoot, workspaceDir, packageName, lockPath));
   } else {
     attempts.push({ type: 'target', package: packageName, skipped: true });
   }
@@ -549,10 +783,14 @@ async function main() {
     for (let depth = 1; depth <= options.maxDepth; depth += 1) {
       const parents = getCandidatesForDepth({
         whyOutput: currentWhy,
+        lockfileText: lockfileSnapshot,
         packageName,
         depth,
         maxParents: options.maxParents,
         visitedParents,
+        semver,
+        alerts,
+        versionsCurrent,
       });
       attemptedParentsByDepth[depth] = parents;
 
@@ -574,16 +812,41 @@ async function main() {
           continue;
         }
 
-        await updatePackage(repoRoot, workspaceDir, parent, semver);
-        attempts.push({ type: 'parent', depth, package: parent });
+        let parentError = null;
+        try {
+          await updatePackage(repoRoot, workspaceDir, parent, semver);
+        } catch (error) {
+          parentError = yarnFailureMessage(error);
+        }
+        attempts.push({
+          type: 'parent',
+          depth,
+          package: parent,
+          error: parentError,
+        });
+        if (parentError) {
+          continue;
+        }
         parentBumpsRan = true;
-        await updatePackage(repoRoot, workspaceDir, packageName, semver);
-        attempts.push({ type: 'target-retry', depth, package: packageName });
-        ({ why: currentWhy, versions: versionsCurrent } = await refreshTargetState(
-          repoRoot,
-          workspaceDir,
-          packageName,
-        ));
+
+        let targetRetryError = null;
+        try {
+          await updatePackage(repoRoot, workspaceDir, packageName, semver);
+        } catch (error) {
+          targetRetryError = yarnFailureMessage(error);
+        }
+        attempts.push({
+          type: 'target-retry',
+          depth,
+          package: packageName,
+          error: targetRetryError,
+        });
+        ({
+          why: currentWhy,
+          versions: versionsCurrent,
+          lockfileText: lockfileSnapshot,
+          whyError: currentWhyError,
+        } = await readTargetState(repoRoot, workspaceDir, packageName, lockPath));
 
         if (isComplete(versionsCurrent)) {
           break;
@@ -622,30 +885,58 @@ async function main() {
     !isComplete(versionsCurrent) &&
     lockfileBeforeParents
   ) {
-    await restoreLockfile(lockPath, lockfileBeforeParents);
-    reverted = true;
-    attempts.push({ type: 'revert', reason: 'incomplete_parent_bumps' });
-    ({ why: currentWhy, versions: versionsCurrent } = await refreshTargetState(
-      repoRoot,
-      workspaceDir,
-      packageName,
-    ));
+    const leftoverAfterTarget = leftoverVersions(
+      semver,
+      alerts,
+      versionsAfterTarget,
+    );
+    const leftoverNow = leftoverVersions(semver, alerts, versionsCurrent);
+    const reducedLeftover =
+      leftoverAfterTarget.length > 0 &&
+      leftoverNow.length < leftoverAfterTarget.length;
+    if (reducedLeftover) {
+      attempts.push({
+        type: 'keep_partial',
+        reason: 'cve_leftover_reduced',
+      });
+    } else {
+      await restoreLockfile(lockPath, lockfileBeforeParents);
+      reverted = true;
+      attempts.push({ type: 'revert', reason: 'incomplete_parent_bumps' });
+      ({
+        why: currentWhy,
+        versions: versionsCurrent,
+        lockfileText: lockfileSnapshot,
+        whyError: currentWhyError,
+      } = await readTargetState(repoRoot, workspaceDir, packageName, lockPath));
+    }
   }
 
+  let refreshInstallError = null;
+  let refreshDedupeError = null;
+  let refreshInstallRetried = false;
   if (
     !dryRun &&
     !reverted &&
     isComplete(versionsCurrent) &&
-    attempts.some(a => !a.skipped && a.type !== 'revert')
+    attempts.some(a => !a.skipped && a.type !== 'revert' && !a.error)
   ) {
-    await refreshLockfile(repoRoot, workspaceDir);
-    attempts.push({ type: 'install' });
-    attempts.push({ type: 'dedupe' });
-    ({ why: currentWhy, versions: versionsCurrent } = await refreshTargetState(
-      repoRoot,
-      workspaceDir,
-      packageName,
-    ));
+    const refresh = await refreshLockfileResilient(repoRoot, workspaceDir);
+    refreshInstallError = refresh.installError;
+    refreshDedupeError = refresh.dedupeError;
+    refreshInstallRetried = refresh.installRetried;
+    attempts.push({
+      type: 'install',
+      error: refresh.installError,
+      retried: refresh.installRetried,
+    });
+    attempts.push({ type: 'dedupe', error: refresh.dedupeError });
+    ({
+      why: currentWhy,
+      versions: versionsCurrent,
+      lockfileText: lockfileSnapshot,
+      whyError: currentWhyError,
+    } = await readTargetState(repoRoot, workspaceDir, packageName, lockPath));
   }
 
   const result = {
@@ -660,6 +951,13 @@ async function main() {
     complete: isComplete(versionsCurrent),
     reverted,
     blockedReason,
+    prepInstallError,
+    prepInstallRetried,
+    refreshInstallError,
+    refreshInstallRetried,
+    refreshDedupeError,
+    yarnWhyError: currentWhyError,
+    usedLockfileFallback: Boolean(currentWhyError || initialWhyError),
     maxDepth: options.maxDepth,
     maxParents: options.maxParents,
     attemptedParentsByDepth,
