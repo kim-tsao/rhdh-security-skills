@@ -373,7 +373,10 @@ node "$SKILL_DIR/scripts/format-bump-pr.js" --title bump.json
 | `--title` | off | Print only `fix(<workspace>): bump yarn.lock packages for Dependabot CVEs` |
 | `--with-title` | off | Print that title, then the PR body |
 
-`partial` rows go in Partial leftovers. `unchanged` rows go in Unchanged. The `remaining` cell is:
+`partial` rows go in Partial leftovers. `unchanged` rows (including `status: error`
+when the lockfile did not move) go in Unchanged. The `remaining` cell always
+describes the CVE leftover — never raw `yarn up` stderr. Use `yarnError` on
+bump `--json` or the bump script stderr summary for command failures.
 
 - `needs <first_patched>` when before === after and every resolved version is still vulnerable
 - `still N.x; patched line is <first_patched>` when leftover is one major and the only patched line is a different major (e.g. react-router 6.x vs 7.18.0)

@@ -131,9 +131,8 @@ function remainingForRow(row, semver) {
 }
 
 function remainingCell(row, semver) {
-  if (row.status === 'error' && row.yarnError) {
-    return row.yarnError;
-  }
+  // Always show CVE leftover context (e.g. "needs 10.4.16"), not yarn stderr.
+  // yarnError stays on bump JSON for debugging; bump script logs failures to stderr.
   return formatRemainingLabel({
     semver,
     versionsBefore: row.versionsBefore,
