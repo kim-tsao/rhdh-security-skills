@@ -781,6 +781,20 @@ async function main() {
     }
   }
 
+  const attemptedBump =
+    !dryRun && packageNames.some(name => !skippedPackages[name]);
+  if (
+    attemptedBump &&
+    !flags.has('no-dedupe') &&
+    !yarnErrors.__install
+  ) {
+    try {
+      await runYarn(repoRoot, workspaceDir, ['dedupe']);
+    } catch (error) {
+      yarnErrors.__finalDedupe = yarnFailureMessage(error);
+    }
+  }
+
   const lockfileAfter = dryRun
     ? lockfileBefore
     : await readFile(lockPath, 'utf8');
@@ -844,8 +858,10 @@ async function main() {
       packageNames.some(name => !skippedPackages[name]) &&
       !flags.has('no-dedupe') &&
       !yarnErrors.__install &&
-      !yarnErrors.__dedupe,
-    dedupeError: yarnErrors.__dedupe || null,
+      !yarnErrors.__dedupe &&
+      !yarnErrors.__finalDedupe,
+    dedupeError:
+      yarnErrors.__finalDedupe || yarnErrors.__dedupe || null,
     ancestorsDespiteInstallFailure,
     skippedPackages: Object.keys(skippedPackages).sort(),
     ancestorAutoPackages: Object.keys(ancestorAuto).sort(),
